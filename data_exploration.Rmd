@@ -4,26 +4,260 @@ output: html_document
 date: "2024-12-05"
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+## Tutorial we used for this
+We used a lot of the code and concepts from: 
+https://alexslemonade.github.io/refinebio-examples/03-rnaseq/dimension-reduction_rnaseq_01_pca.html
+https://alexslemonade.github.io/refinebio-examples/03-rnaseq/dimension-reduction_rnaseq_02_umap.html
+
+## Installing Libraries 
+
+```{r}
+install.packages("BiocManager")
+
 ```
 
-## R Markdown
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager")
+}
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+BiocManager::install("DESeq2")
 
-```{r cars}
-summary(cars)
+if (!("DESeq2" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  BiocManager::install("DESeq2", update = FALSE)
+}
+if (!("EnhancedVolcano" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  BiocManager::install("EnhancedVolcano", update = FALSE)
+}
+if (!("apeglm" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  BiocManager::install("apeglm", update = FALSE)
+}
+
+if (!("M3C" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  BiocManager::install("M3C", update = FALSE)
+}
+if (!("umap" %in% installed.packages())) {
+  # Install umap package
+  BiocManager::install("umap", update = FALSE)
+}
 ```
 
-## Including Plots
-
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
+```{r}
+# Load the packages
+library(DESeq2)
+library(umap)
+library(org.Hs.eg.db)
+library(magrittr)
+library(readr)
+library(ggplot2)
+library(M3C)
+library(tibble)
+library(dplyr)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r}
+set.seed(12345)
+```
+
+
+## Reading Data into DataFrames
+
+```{r}
+# Define directory paths for metadata and gene expression files
+data_dir <- file.path("data", "SRP071965")
+
+
+# Define file paths
+metadata_file <- file.path(data_dir, "metadata_SRP071965.tsv")
+data_file <- file.path(data_dir, "SRP071965.tsv")
+```
+
+```{r}
+# Read metadata and gene expression data into data frames
+metadata <- readr::read_tsv(metadata_file)
+
+expression_df <- readr::read_tsv(data_file)
+```
+
+```{r}
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+
+# Assuming `expression_df` has a column named "gene" with Ensembl IDs
+expression_df$hugo <- mapIds(
+  org.Hs.eg.db,
+  keys = expression_df$Gene,
+  column = "SYMBOL",
+  keytype = "ENSEMBL",
+  multiVals = "first"
+)
+
+# Reorder columns to make 'hugo' the second column
+expression_df <- expression_df %>%
+  select(Gene, hugo, everything())
+
+# Save the updated dataframe to a new file
+output_file <- file.path(data_dir, "SRP071965_with_HUGO.tsv")
+readr::write_tsv(expression_df, output_file)
+
+
+head(expression_df)
+
+
+```
+
+
+
+```{r}
+library(tidyr)
+expression_df <- expression_df %>%
+  drop_na(hugo)
+
+expression_df <- expression_df %>%
+  distinct(hugo, .keep_all = TRUE)
+
+expression_df <- expression_df %>%
+  select(-Gene)
+
+expression_df <- expression_df %>%
+  rename(Gene = hugo)
+
+expression_df
+
+expression_df <- expression_df %>%
+   tibble::column_to_rownames("Gene")
+
+filtered_expression_df <- expression_df %>%
+  dplyr::filter(rowSums(.) >= 10)
+
+
+filtered_expression_df
+
+readr::write_tsv(
+  filtered_expression_df,
+  file.path(
+    data_dir,
+    "filtered_expression_df.tsv" # Replace with a relevant output file name
+  ))
+```
+
+```{r}
+
+filtered_metadata <- metadata %>%
+  select(refinebio_accession_code, refinebio_subject) %>%
+  mutate(refinebio_subject = recode(refinebio_subject, 
+                                   "blood, control" = "control", 
+                                   "blood, case" = "case"))
+
+# View the resulting dataframe
+filtered_metadata
+```
+
+```{r}
+print("hi")
+```
+
+
+```{r}
+
+
+library(dplyr)
+filtered_expression_df
+
+gene_matrix <- round(filtered_expression_df)
+gene_matrix
+
+ddset <- DESeqDataSetFromMatrix(
+  # Here we supply non-normalized count data
+  countData = gene_matrix,
+  # Supply the `colData` with our metadata data frame
+  colData = filtered_metadata,
+  # Supply our experimental variable to `design`
+  design = ~refinebio_subject
+)
+
+deseq_object <- DESeq(ddset)
+```
+
+```{r}
+deseq_results <- results(deseq_object)
+resultsNames(deseq_object)
+```
+```{r}
+deseq_df <- deseq_results %>%
+  # Make into data.frame
+  as.data.frame() %>%
+  # The gene names are row names -- let's make them a column for easy display
+  tibble::rownames_to_column("Gene") %>%
+  # Add a column for significance threshold results
+  dplyr::mutate(threshold = padj < 0.05) %>%
+  # Sort by statistic -- the highest values will be genes with
+  # Higher expression in RPL10 mutated samples
+  dplyr::arrange(dplyr::desc(log2FoldChange))
+
+deseq_df
+```
+
+```{r}
+deseq_df$abs_log2FoldChange <- abs(deseq_df$log2FoldChange)
+
+# order by the absolute log2FoldChange in descending order
+#deseq_df_sorted <- deseq_df[order(-deseq_df$abs_log2FoldChange), ]
+deseq_df_sorted <- deseq_df %>%
+  arrange(desc(abs_log2FoldChange))
+
+# select the top 50 genes
+top50_genes <- head(deseq_df_sorted, 50)
+top50_genes
+# remove the absolute value col
+top50_genes <- top50_genes[, !(names(top50_genes) %in% c("abs_log2FoldChange"))]
+
+# display the top 50 genes
+top50_genes <- top50_genes %>%
+   tibble::column_to_rownames("Gene")
+top50_genes
+```
+
+```{r}
+top50_gene_names <- rownames(top50_genes)
+
+subset_expression_df <- expression_df %>%
+  rownames_to_column("Gene") %>%  # Convert row names to a column called "Gene"
+  filter(Gene %in% top50_gene_names) %>%  # Filter by genes in your list
+  column_to_rownames("Gene") 
+
+subset_expression_df
+```
+
+```{r}
+library(pheatmap)
+library(dplyr)
+
+# Ensure that the accession code in filtered_metadata matches the columns in subset_expression_df
+annotation_df <- filtered_metadata %>%
+  dplyr::select(refinebio_accession_code, refinebio_subject) %>%
+  column_to_rownames("refinebio_accession_code")  # Use accession code as row names for annotation
+
+# Make sure the order of samples in annotation_df matches the order in subset_expression_df
+annotation_df <- annotation_df[match(colnames(subset_expression_df), rownames(annotation_df)), , drop = FALSE]
+
+# Create the heatmap
+heatmap <- pheatmap(
+  subset_expression_df,
+  cluster_rows = TRUE,    # Cluster the rows of the heatmap
+  cluster_cols = TRUE,    # Cluster the columns of the heatmap
+  show_rownames = FALSE,  # There are too many genes to clearly show the labels
+  main = "Annotated Heatmap",  # Title for the heatmap
+  colorRampPalette(c("navy", "white", "firebrick"))(25),
+  scale = "row",          # Scale values in the direction of genes (rows)
+  fontsize = 8,           # Increase the font size
+  angle_col = 90,         # Rotate the column labels for better readability
+  width = 20,             # Adjust width as needed
+  height = 20,            # Adjust height as needed
+  annotation_col = annotation_df  # Add the sample classification as annotations for columns
+)
